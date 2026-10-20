@@ -12,7 +12,7 @@ import time
 import tkinter as tk
 
 import winctl
-from sequence import SequenceError, Settings, run_sequence
+from sequence import SequenceError, Settings, Target, run_sequence
 
 PROMPT = "Refactor the parser.\nSecond line with unicode: café ✓"
 FAKE_TITLE = "FakeCodex 5h-limit test"
@@ -85,19 +85,19 @@ def main():
         found = winctl.find_window("", FAKE_TITLE)
         wx, wy, ww, wh = found.rect
         preset = [wx + 260, wy + 140, ww, wh]  # somewhere else on screen, same size
-        s = Settings(
-            prompt=PROMPT, win_exe=found.exe, win_title=FAKE_TITLE, win_rect=preset,
+        target = Target(
+            exe=found.exe, title=FAKE_TITLE, rect=preset,
             prompt_pt=[info["box"][0] - wx, info["box"][1] - wy],
             start_pt=[info["start"][0] - wx, info["start"][1] - wy],
-            paste_wait_s=0.5,
         )
+        s = Settings(prompt=PROMPT, paste_wait_s=0.5, profile="Fake", profiles={"Fake": target})
 
         logs = []
         run_sequence(s, dry_run=True, log=logs.append)
         now = winctl.window_rect(found.hwnd)
         results.append(check("window moved to preset", list(now) == preset, f"{list(now)} != {preset}"))
         results.append(check("test run does not click Start", not os.path.exists(result_path)))
-        sx, sy = s.start_pt[0] + preset[0], s.start_pt[1] + preset[1]
+        sx, sy = target.start_pt[0] + preset[0], target.start_pt[1] + preset[1]
         results.append(check("test run parks cursor on Start", winctl.cursor_pos() == (sx, sy), f"{winctl.cursor_pos()} != {(sx, sy)}"))
 
         run_sequence(s, log=logs.append)

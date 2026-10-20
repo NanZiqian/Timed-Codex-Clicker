@@ -1,7 +1,7 @@
 {
-  "prompt": "Hello!",
-  "mode": "countdown",
-  "when": "",
+  "prompt": "you lost connection, continue your work",
+  "mode": "clock",
+  "when": "20:02",
   "buffer_s": 60,
   "keep_awake": true,
   "clear_first": true,
@@ -9,17 +9,17 @@
   "win_exe": "ChatGPT.exe",
   "win_title": "ChatGPT",
   "win_rect": [
-    574,
-    118,
-    1544,
-    1066
+    212,
+    36,
+    1952,
+    1367
   ],
   "prompt_pt": [
-    548,
-    950
+    709,
+    1207
   ],
   "start_pt": [
-    1383,
-    1018
+    1824,
+    1295
   ]
 }

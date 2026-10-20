@@ -1,4 +1,4 @@
-"""Timed clicker: wait for the Codex 5h limit to reset, then paste the prompt and click Start."""
+"""Timed clicker: wait for a coding agent's usage limit to reset, then paste the prompt and click Start."""
 import os
 import sys
 import time
@@ -9,7 +9,7 @@ from tkinter import messagebox, scrolledtext, ttk
 
 import timeparse
 import winctl
-from sequence import SequenceError, Settings, run_sequence
+from sequence import SequenceError, Target, Settings, agent_name, run_sequence, shutdown_computer, title_filter
 
 try:
     import winsound
@@ -24,6 +24,8 @@ CAPTURE_SECONDS = 5
 MAX_ATTEMPTS = 3
 RETRY_WAIT_MS = 20_000
 UNLOCK_WAIT_S = 3600  # how long past the fire time to keep waiting for the screen to be unlocked
+SHUTDOWN_WARN_S = 30  # visible countdown, with Cancel, before the hotkey and shutdown
+HOTKEY_SETTLE_MS = 5000  # pause between the hotkey and the shutdown, for the background app to react
 RED = "#b91c1c"
 GREEN = "#15803d"
 
@@ -33,7 +35,9 @@ class App:
         self.root = root
         self.s = Settings.load(CONFIG_PATH)
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
-        self.fire_at = None  # epoch seconds while armed
+        self.fire_at = None  # epoch seconds while armed, waiting to click Start
+        self.shutdown_at = None  # epoch seconds while waiting to shut down after Start was clicked
+        self.warning = False  # in the final shutdown countdown
         self.tick_job = None
         root.title("Timed Clicker")
         try:
@@ -41,12 +45,15 @@ class App:
         except tk.TclError:
             pass
         self.build()
-        self.refresh_calibration()
+        self.refresh_profiles()
         self.preview()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def px(self, n):
         return int(n * self.scale)
+
+    def active(self):
+        return self.fire_at is not None or self.shutdown_at is not None or self.warning
 
     # --- layout ------------------------------------------------------------
 
@@ -55,21 +62,26 @@ class App:
         main = ttk.Frame(self.root, padding=p)
         main.pack(fill="both", expand=True)
 
-        cal = ttk.LabelFrame(main, text="1 · Calibrate", padding=p)
+        cal = ttk.LabelFrame(main, text="1 · Target app and calibration", padding=p)
         cal.pack(fill="x")
         cal.columnconfigure((0, 1, 2), weight=1)
+        ttk.Label(cal, text="Target agent:").grid(row=0, column=0, sticky="w")
+        self.profile_box = ttk.Combobox(cal, state="readonly")
+        self.profile_box.grid(row=0, column=1, sticky="ew", padx=(p, 0))
+        self.profile_box.bind("<<ComboboxSelected>>", lambda _: self.select_profile(self.profile_box.get()))
+        ttk.Button(cal, text="Delete", command=self.delete_profile).grid(row=0, column=2, sticky="ew", padx=(p, 0))
         self.cal_lbl = ttk.Label(cal, justify="left")
-        self.cal_lbl.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.cal_lbl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(p, 0))
         buttons = [("window", "Capture window"), ("prompt", "Capture prompt box"), ("start", "Capture Start button")]
         for i, (what, text) in enumerate(buttons):
             ttk.Button(cal, text=text, command=lambda w=what: self.begin_capture(w)).grid(
-                row=1, column=i, sticky="ew", padx=(0 if i == 0 else p, 0), pady=(p, 0))
-        ttk.Label(cal, text="Window title contains:").grid(row=2, column=0, sticky="w", pady=(p, 0))
-        self.title_var = tk.StringVar(value=self.s.win_title)
-        ttk.Entry(cal, textvariable=self.title_var).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(p, 0), pady=(p, 0))
-        ttk.Button(cal, text="Move window to preset", command=self.move_to_preset).grid(row=3, column=0, sticky="ew", pady=(p, 0))
+                row=2, column=i, sticky="ew", padx=(0 if i == 0 else p, 0), pady=(p, 0))
+        ttk.Label(cal, text="Window title contains:").grid(row=3, column=0, sticky="w", pady=(p, 0))
+        self.title_var = tk.StringVar()
+        ttk.Entry(cal, textvariable=self.title_var).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(p, 0), pady=(p, 0))
+        ttk.Button(cal, text="Move window to preset", command=self.move_to_preset).grid(row=4, column=0, sticky="ew", pady=(p, 0))
         ttk.Button(cal, text="Test (stops before Start)", command=lambda: self.fire(dry_run=True)).grid(
-            row=3, column=1, columnspan=2, sticky="ew", padx=(p, 0), pady=(p, 0))
+            row=4, column=1, columnspan=2, sticky="ew", padx=(p, 0), pady=(p, 0))
 
         when = ttk.LabelFrame(main, text="2 · When to start", padding=p)
         when.pack(fill="x", pady=(p, 0))
@@ -92,9 +104,27 @@ class App:
 
         prompt = ttk.LabelFrame(main, text="3 · Prompt to paste", padding=p)
         prompt.pack(fill="both", expand=True, pady=(p, 0))
-        self.prompt_txt = tk.Text(prompt, height=5, width=64, wrap="word", font=("Segoe UI", 10), undo=True)
+        self.prompt_txt = tk.Text(prompt, height=4, width=64, wrap="word", font=("Segoe UI", 10), undo=True)
         self.prompt_txt.pack(fill="both", expand=True)
         self.prompt_txt.insert("1.0", self.s.prompt)
+
+        after = ttk.LabelFrame(main, text="4 · After Start is clicked (optional)", padding=p)
+        after.pack(fill="x", pady=(p, 0))
+        after.columnconfigure(3, weight=1)
+        self.shut_var = tk.BooleanVar(value=self.s.shutdown_on)
+        self.shut_min_var = tk.StringVar(value=str(self.s.shutdown_after_min))
+        self.hotkey_var = tk.StringVar(value=self.s.hotkey)
+        self.force_var = tk.BooleanVar(value=self.s.force_shutdown)
+        ttk.Checkbutton(after, text="Shut down the PC", variable=self.shut_var).grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(after, from_=1, to=2880, increment=10, width=6, textvariable=self.shut_min_var).grid(row=0, column=1, padx=(p, 0))
+        ttk.Label(after, text="minutes after clicking Start").grid(row=0, column=2, columnspan=2, sticky="w", padx=(p // 2, 0))
+        ttk.Label(after, text="Press hotkey first:").grid(row=1, column=0, sticky="w", pady=(p, 0))
+        ttk.Entry(after, textvariable=self.hotkey_var, width=14).grid(row=1, column=1, columnspan=2, sticky="w", padx=(p, 0), pady=(p, 0))
+        ttk.Button(after, text="Test hotkey (in 3 s)", command=self.test_hotkey).grid(row=1, column=3, sticky="e", pady=(p, 0))
+        ttk.Checkbutton(after, text="Force-close apps that block shutdown (may lose unsaved work)",
+                        variable=self.force_var).grid(row=2, column=0, columnspan=4, sticky="w", pady=(p, 0))
+        ttk.Label(after, text=f"The PC stays awake until then. You get a {SHUTDOWN_WARN_S}s warning with a Cancel button.",
+                  foreground="#555").grid(row=3, column=0, columnspan=4, sticky="w", pady=(p // 2, 0))
 
         opts = ttk.Frame(main)
         opts.pack(fill="x", pady=(p, 0))
@@ -111,15 +141,14 @@ class App:
         actions.columnconfigure((0, 1, 2), weight=1)
         self.arm_btn = ttk.Button(actions, text="Arm", command=self.arm)
         self.arm_btn.grid(row=0, column=0, sticky="ew")
-        self.disarm_btn = ttk.Button(actions, text="Disarm", command=self.disarm, state="disabled")
+        self.disarm_btn = ttk.Button(actions, text="Disarm", command=self.on_disarm, state="disabled")
         self.disarm_btn.grid(row=0, column=1, sticky="ew", padx=(p, 0))
-        ttk.Button(actions, text="Run now (clicks Start!)", command=lambda: self.fire()).grid(
-            row=0, column=2, sticky="ew", padx=(p, 0))
+        ttk.Button(actions, text="Run now (clicks Start!)", command=self.run_now).grid(row=0, column=2, sticky="ew", padx=(p, 0))
 
         self.status_var = tk.StringVar(value="Not armed")
         self.status_lbl = ttk.Label(main, textvariable=self.status_var, font=("Segoe UI", 12, "bold"), justify="left")
         self.status_lbl.pack(fill="x", pady=(p, 0))
-        self.log_txt = scrolledtext.ScrolledText(main, height=4, width=64, state="disabled", font=("Consolas", 9))
+        self.log_txt = scrolledtext.ScrolledText(main, height=3, width=64, state="disabled", font=("Consolas", 9))
         self.log_txt.pack(fill="both", expand=True, pady=(p // 2, 0))
 
         self.locked_while_armed = [self.disarm_btn, self.log_txt]
@@ -127,7 +156,8 @@ class App:
 
         # Open near the top-left of the screen so the whole form is visible and out of the way of the target app.
         self.root.update_idletasks()
-        self.root.geometry(f"+{self.px(40)}+{self.px(30)}")
+        y = max(0, min(self.px(30), self.root.winfo_screenheight() - self.root.winfo_reqheight() - self.px(60)))
+        self.root.geometry(f"+{self.px(40)}+{y}")
 
     def set_editing(self, enabled):
         """Grey out everything but Disarm and the log while armed."""
@@ -167,6 +197,10 @@ class App:
         self.status_var.set(text)
         self.status_lbl.config(foreground=color or "")
 
+    def schedule(self, ms, fn, *args):
+        """Every timed step goes through one slot so a single cancel stops whatever is pending."""
+        self.tick_job = self.root.after(ms, fn, *args)
+
     @staticmethod
     def number(text, default, cast=int):
         try:
@@ -176,13 +210,18 @@ class App:
 
     def sync_settings(self):
         s = self.s
-        s.win_title = self.title_var.get().strip()
+        if s.target:
+            s.target.title = self.title_var.get().strip()
         s.mode = self.mode_var.get()
         s.when = self.when_var.get().strip()
         s.buffer_s = self.number(self.buffer_var.get(), 60)
         s.clear_first = self.clear_var.get()
         s.keep_awake = self.awake_var.get()
         s.paste_wait_s = self.number(self.wait_var.get(), 1.0, float)
+        s.shutdown_on = self.shut_var.get()
+        s.shutdown_after_min = self.number(self.shut_min_var.get(), 120)
+        s.hotkey = self.hotkey_var.get().strip()
+        s.force_shutdown = self.force_var.get()
         s.prompt = self.prompt_txt.get("1.0", "end-1c")
 
     def save(self):
@@ -192,21 +231,40 @@ class App:
         except OSError as e:
             self.log(f"Could not save settings: {e}")
 
-    # --- calibration -------------------------------------------------------
+    # --- target profiles and calibration -----------------------------------
 
-    def refresh_calibration(self):
+    def refresh_profiles(self):
         s = self.s
-        if s.win_rect:
-            x, y, w, h = s.win_rect
-            win = f'Window: {s.win_exe}  "{s.win_title}"  preset {w}×{h} at {x},{y}'
+        self.profile_box.config(values=sorted(s.profiles))
+        self.profile_box.set(s.profile if s.target else "")
+        t = s.target
+        self.title_var.set(t.title if t else "")
+        if t and t.rect:
+            x, y, w, h = t.rect
+            win = f'Window: {t.exe}  preset {w}×{h} at {x},{y}'
         else:
-            win = "Window: not captured"
-        prompt = f"+{s.prompt_pt[0]},{s.prompt_pt[1]}" if s.prompt_pt else "not captured"
-        start = f"+{s.start_pt[0]},{s.start_pt[1]}" if s.start_pt else "not captured"
+            win = "Window: not captured. Open the agent app, then press Capture window."
+        prompt = f"+{t.prompt_pt[0]},{t.prompt_pt[1]}" if t and t.prompt_pt else "not captured"
+        start = f"+{t.start_pt[0]},{t.start_pt[1]}" if t and t.start_pt else "not captured"
         self.cal_lbl.config(text=f"{win}\nPrompt box: {prompt}     Start button: {start}")
 
+    def select_profile(self, name):
+        self.sync_settings()  # keeps the title filter typed for the profile we're leaving
+        self.s.profile = name
+        self.refresh_profiles()
+        self.save()
+
+    def delete_profile(self):
+        name = self.s.profile
+        if not name or not messagebox.askyesno("Timed Clicker", f"Delete the saved target {name!r}?"):
+            return
+        self.s.profiles.pop(name, None)
+        self.s.profile = next(iter(sorted(self.s.profiles)), "")
+        self.refresh_profiles()
+        self.save()
+
     def begin_capture(self, what):
-        label = {"window": "the Codex window", "prompt": "the prompt box", "start": "the Start button"}[what]
+        label = {"window": "the agent window", "prompt": "the prompt box", "start": "the Start button"}[what]
         self.sync_settings()
         overlay = tk.Toplevel(self.root)
         overlay.overrideredirect(True)
@@ -241,40 +299,48 @@ class App:
             self.log(f"Capture at {x},{y} found no other window under the cursor - try again")
             return
         if what == "window":
-            if s.win_rect and list(info.rect[2:]) != list(s.win_rect[2:]):
-                s.prompt_pt = s.start_pt = None
+            name = agent_name(info.exe, info.title)
+            t = s.profiles.get(name) or Target()
+            if t.rect and list(info.rect[2:]) != list(t.rect[2:]):
+                t.prompt_pt = t.start_pt = None
                 self.log("Window size changed, so the prompt box and Start button need capturing again")
-            s.win_exe, s.win_title, s.win_rect = info.exe, info.title, list(info.rect)
-            self.title_var.set(info.title)
-            self.log(f"Captured window {info.exe} - {info.title!r} ({info.rect[2]}x{info.rect[3]} at {info.rect[0]},{info.rect[1]})")
+            t.exe, t.rect = info.exe, list(info.rect)
+            t.title = title_filter(info.title)
+            s.profiles[name] = t
+            s.profile = name
+            self.log(f"Detected {name}: {info.exe} - {info.title!r} ({info.rect[2]}x{info.rect[3]} at {info.rect[0]},{info.rect[1]})")
+            if not t.title:
+                self.log("The window title looks like it changes, so it is matched on the program name only")
         else:
-            if not s.win_rect:
+            t = s.target
+            if not t or not t.rect:
                 self.log("Capture the window first")
                 return
-            if info.exe.lower() != s.win_exe.lower():
-                self.log(f"The cursor was over {info.exe}, not {s.win_exe} - try again")
+            if info.exe.lower() != t.exe.lower():
+                self.log(f"The cursor was over {info.exe}, not {t.exe} - try again")
                 return
-            if list(info.rect[2:]) != list(s.win_rect[2:]):
+            if list(info.rect[2:]) != list(t.rect[2:]):
                 self.log("WARNING: the window is not at its preset size; use 'Move window to preset' and capture again")
             offset = [x - info.rect[0], y - info.rect[1]]
             if what == "prompt":
-                s.prompt_pt = offset
+                t.prompt_pt = offset
             else:
-                s.start_pt = offset
+                t.start_pt = offset
             self.log(f"Captured {what} point at +{offset[0]},{offset[1]} from the window corner")
-        self.refresh_calibration()
+        self.refresh_profiles()
         self.save()
 
     def move_to_preset(self):
         self.sync_settings()
-        if not self.s.win_rect:
+        t = self.s.target
+        if not t or not t.rect:
             self.log("Capture the window first")
             return
-        info = winctl.find_window(self.s.win_exe, self.s.win_title)
+        info = winctl.find_window(t.exe, t.title)
         if not info:
-            self.log(f"No visible window found for {self.s.win_exe} / {self.s.win_title!r}")
+            self.log(f"No visible window found for {t.exe} / {t.title!r}")
             return
-        winctl.place_window(info.hwnd, self.s.win_rect)
+        winctl.place_window(info.hwnd, t.rect)
         winctl.raise_window(info.hwnd)
         self.log(f"Moved {info.exe} - {info.title!r} to its preset position")
 
@@ -285,7 +351,7 @@ class App:
         return timeparse.resolve_target(self.s.mode, self.s.when, datetime.now(), self.s.buffer_s)
 
     def preview(self):
-        if self.fire_at:
+        if self.active():
             return
         try:
             t = self.resolve()
@@ -304,13 +370,33 @@ class App:
             self.resolve()
         except ValueError as e:
             return str(e)
+        if self.s.shutdown_on:
+            if self.s.shutdown_after_min < 1:
+                return "Shutdown delay must be at least 1 minute."
+            if self.s.hotkey:
+                try:
+                    winctl.parse_hotkey(self.s.hotkey)
+                except ValueError as e:
+                    return str(e)
         return None
+
+    def confirm_shutdown(self):
+        s = self.s
+        if not s.shutdown_on:
+            return True
+        hotkey = f"press {s.hotkey}, then " if s.hotkey else ""
+        force = "\n\nForce-close is ON: apps with unsaved work will be closed without asking." if s.force_shutdown else ""
+        return messagebox.askyesno(
+            "Timed Clicker",
+            f"{s.shutdown_after_min} minutes after Start is clicked this PC will {hotkey}shut down.{force}\n\nContinue?")
 
     def arm(self):
         self.sync_settings()
         issue = self.problem()
         if issue:
             messagebox.showerror("Can't arm", issue)
+            return
+        if not self.confirm_shutdown():
             return
         self.fire_at = self.resolve().timestamp()
         self.save()
@@ -320,13 +406,24 @@ class App:
         self.log(f"Armed for {datetime.fromtimestamp(self.fire_at):%a %d %b %H:%M:%S}")
         self.tick()
 
-    def disarm(self, message="Not armed"):
+    def run_now(self):
+        self.sync_settings()
+        if self.confirm_shutdown():
+            self.fire()
+
+    def on_disarm(self):
+        self.log("Cancelled" if self.fire_at else "Shutdown cancelled")
+        self.cancel_all()
+
+    def cancel_all(self, message="Not armed"):
         if self.tick_job:
             self.root.after_cancel(self.tick_job)
             self.tick_job = None
-        self.fire_at = None
+        self.fire_at = self.shutdown_at = None
+        self.warning = False
         winctl.keep_awake(False)
         self.set_editing(True)
+        self.disarm_btn.config(text="Disarm")
         self.status(message)
         self.preview()
 
@@ -337,7 +434,7 @@ class App:
             return
         when = datetime.fromtimestamp(self.fire_at)
         self.status(f"Armed - fires {when:%a %H:%M:%S}\n{timeparse.format_remaining(left)} left", GREEN)
-        self.tick_job = self.root.after(500 if left < 120 else 1000, self.tick)
+        self.schedule(500 if left < 120 else 1000, self.tick)
 
     # --- firing ------------------------------------------------------------
 
@@ -346,7 +443,7 @@ class App:
         self.save()
         if armed and winctl.session_locked() and time.time() < self.fire_at + UNLOCK_WAIT_S:
             self.status("Time reached, but the screen is locked.\nWaiting for you to unlock it...", RED)
-            self.tick_job = self.root.after(2000, self.fire, dry_run, attempt)
+            self.schedule(2000, self.fire, dry_run, attempt)
             return
         self.status("Running...")
         self.root.iconify()
@@ -364,20 +461,105 @@ class App:
         if error and armed and attempt < MAX_ATTEMPTS:
             self.log(f"FAILED (attempt {attempt}/{MAX_ATTEMPTS}): {error}")
             self.status(f"Failed - retrying in {RETRY_WAIT_MS // 1000}s ({attempt}/{MAX_ATTEMPTS})", RED)
-            self.tick_job = self.root.after(RETRY_WAIT_MS, self.fire, dry_run, attempt + 1)
+            self.schedule(RETRY_WAIT_MS, self.fire, dry_run, attempt + 1)
             return
-        if armed:
-            self.disarm()
         if error:
+            if armed:
+                self.cancel_all()
             self.log(f"FAILED: {error}")
             self.status("Failed - see the log", RED)
             self.beep(300, 500)
             messagebox.showerror("Timed Clicker", error)
+        elif dry_run:
+            self.status("Test finished - cursor is on the Start button", GREEN)
+        elif self.s.shutdown_on:
+            self.begin_wait()
         else:
-            self.status("Test finished - cursor is on the Start button" if dry_run else f"Done at {datetime.now():%H:%M:%S}", GREEN)
+            if armed:
+                self.cancel_all()
+            self.status(f"Done at {datetime.now():%H:%M:%S}", GREEN)
+
+    # --- after Start: wait, hotkey, shutdown -------------------------------
+
+    def begin_wait(self):
+        self.fire_at = None
+        self.shutdown_at = time.time() + self.s.shutdown_after_min * 60
+        winctl.keep_awake(True)  # the task is running now; sleeping would kill it whatever the checkbox says
+        self.set_editing(False)
+        self.disarm_btn.config(text="Cancel shutdown")
+        self.log(f"Start clicked. Shutting down at {datetime.fromtimestamp(self.shutdown_at):%a %H:%M:%S}")
+        self.wait_tick()
+
+    def wait_tick(self):
+        left = self.shutdown_at - time.time()
+        if left <= 0:
+            self.warn_tick(SHUTDOWN_WARN_S)
+            return
+        at = datetime.fromtimestamp(self.shutdown_at)
+        self.status(f"Task running - shutdown at {at:%a %H:%M:%S}\n{timeparse.format_remaining(left)} left", GREEN)
+        self.schedule(1000, self.wait_tick)
+
+    def warn_tick(self, n):
+        if n <= 0:
+            self.press_hotkey_then_shutdown()
+            return
+        self.warning = True
+        self.status(f"SHUTTING DOWN in {n}s\nPress Cancel shutdown to stop it", RED)
+        self.beep(700, 80)
+        self.schedule(1000, self.warn_tick, n - 1)
+
+    def press_hotkey(self, then=None):
+        """Bring this window to the front (so the keys don't land in the agent app), then press the hotkey."""
+        vks = winctl.parse_hotkey(self.s.hotkey)
+        self.root.deiconify()
+        winctl.force_foreground(winctl.top_level_of(self.root.winfo_id()))
+        self.schedule(400, self.send_hotkey, vks, then)  # let the window take focus first
+
+    def send_hotkey(self, vks, then):
+        try:
+            foreground = winctl.foreground_exe()
+            winctl.key_chord(*vks, hold=0.15)
+            self.log(f"Pressed {self.s.hotkey} (foreground app: {foreground})")
+        except Exception as e:
+            self.log(f"Hotkey failed: {e}")
+        if then:
+            self.status("Hotkey sent - shutting down...", RED)
+            self.schedule(HOTKEY_SETTLE_MS, then)
+
+    def press_hotkey_then_shutdown(self):
+        self.warning = False
+        if not self.s.hotkey:
+            self.issue_shutdown()
+            return
+        try:
+            self.press_hotkey(then=self.issue_shutdown)
+        except Exception as e:
+            self.log(f"Hotkey failed: {e}")
+            self.issue_shutdown()
+
+    def issue_shutdown(self):
+        try:
+            shutdown_computer(self.s.force_shutdown)
+        except Exception as e:
+            self.log(f"FAILED to shut down: {e}")
+            self.cancel_all("Shutdown failed - see the log")
+            messagebox.showerror("Timed Clicker", f"Could not shut down: {e}")
+            return
+        self.log("Shutdown requested")
+        self.cancel_all("Shutdown requested - the PC is shutting down")
+
+    def test_hotkey(self):
+        self.sync_settings()
+        try:
+            winctl.parse_hotkey(self.s.hotkey)
+        except ValueError as e:
+            messagebox.showerror("Hotkey", str(e))
+            return
+        self.log(f"Pressing {self.s.hotkey} in 3 seconds")
+        self.schedule(3000, self.press_hotkey)
 
     def on_close(self):
-        if self.fire_at and not messagebox.askyesno("Timed Clicker", "It is armed. Quit and cancel the scheduled click?"):
+        if self.active() and not messagebox.askyesno("Timed Clicker", "Something is scheduled. Quit and cancel it?"):
             return
         self.save()
         winctl.keep_awake(False)

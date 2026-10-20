@@ -1,6 +1,7 @@
 """Win32 helpers for the timed clicker: cursor, mouse, keys, clipboard, windows, power state."""
 import ctypes
 import os
+import re
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -10,7 +11,10 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 OWN_PID = os.getpid()
 
+VK_SHIFT = 0x10
 VK_CONTROL = 0x11
+VK_MENU = 0x12  # Alt
+VK_LWIN = 0x5B
 VK_A = 0x41
 VK_V = 0x56
 
@@ -62,6 +66,10 @@ _sig(user32.ShowWindow, wintypes.BOOL, wintypes.HWND, ctypes.c_int)
 _sig(user32.MoveWindow, wintypes.BOOL, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL)
 _sig(user32.SetWindowPos, wintypes.BOOL, wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT)
 _sig(user32.SetForegroundWindow, wintypes.BOOL, wintypes.HWND)
+_sig(user32.GetForegroundWindow, wintypes.HWND)
+_sig(user32.BringWindowToTop, wintypes.BOOL, wintypes.HWND)
+_sig(user32.AttachThreadInput, wintypes.BOOL, wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+_sig(kernel32.GetCurrentThreadId, wintypes.DWORD)
 _sig(user32.EnumWindows, wintypes.BOOL, WNDENUMPROC, wintypes.LPARAM)
 _sig(user32.GetDesktopWindow, wintypes.HWND)
 _sig(user32.OpenClipboard, wintypes.BOOL, wintypes.HWND)
@@ -114,12 +122,39 @@ def click(x, y):
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
-def key_chord(*vks):
+def key_chord(*vks, hold=0.05):
     for vk in vks:
         user32.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.05)
+    time.sleep(hold)
     for vk in reversed(vks):
         user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+
+_MODIFIERS = {"ctrl": VK_CONTROL, "control": VK_CONTROL, "alt": VK_MENU, "shift": VK_SHIFT, "win": VK_LWIN, "windows": VK_LWIN}
+_NAMED_KEYS = {"enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20, "backspace": 0x08}
+
+
+def parse_hotkey(text):
+    """Virtual-key codes (modifiers first) for a hotkey like "alt+s", "ctrl+shift+f5" or "win+7"."""
+    parts = [p.strip().lower() for p in text.split("+")]
+    if not text.strip() or not all(parts):
+        raise ValueError("enter a hotkey such as alt+s")
+    mods, keys = [], []
+    for p in parts:
+        if p in _MODIFIERS:
+            if _MODIFIERS[p] not in mods:
+                mods.append(_MODIFIERS[p])
+        elif len(p) == 1 and p.isascii() and p.isalnum():
+            keys.append(ord(p.upper()))  # virtual-key codes for A-Z and 0-9 are their ASCII codes
+        elif re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", p):
+            keys.append(0x70 + int(p[1:]) - 1)
+        elif p in _NAMED_KEYS:
+            keys.append(_NAMED_KEYS[p])
+        else:
+            raise ValueError(f"unknown key {p!r} in hotkey")
+    if len(keys) != 1:
+        raise ValueError("a hotkey needs exactly one key besides ctrl/alt/shift/win, e.g. alt+s")
+    return mods + keys
 
 
 # --- clipboard -------------------------------------------------------------
@@ -250,6 +285,30 @@ def raise_window(hwnd):
     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
     user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
     user32.SetForegroundWindow(hwnd)  # best effort; the click that follows activates it anyway
+
+
+def top_level_of(hwnd):
+    """The top-level window containing hwnd (Tk's winfo_id() is an inner window)."""
+    return user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+
+
+def force_foreground(hwnd):
+    """Take the foreground for hwnd by briefly sharing input state with the current foreground thread."""
+    fg = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    my_thread = kernel32.GetCurrentThreadId()
+    attached = bool(fg_thread) and fg_thread != my_thread and user32.AttachThreadInput(my_thread, fg_thread, True)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(my_thread, fg_thread, False)
+
+
+def foreground_exe():
+    hwnd = user32.GetForegroundWindow()
+    return describe(top_level_of(hwnd)).exe if hwnd else ""
 
 
 # --- session / power -------------------------------------------------------
